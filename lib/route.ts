@@ -9,6 +9,22 @@
 //     little its provider has been called so far (which spreads load over
 //     equal-rated models), then by provider and model id, so the order is a pure
 //     function of the brief and the answers seen so far;
+//   - a provider's first call always answers: its failure schedule starts at
+//     call two, its budget is at least four calls, and its outage starts at
+//     call two. So a provider that has not been called yet is a certain answer,
+//     while a provider already in use may refuse its next call. The ranking
+//     therefore charges a provider that has been called a flat 40 milli off its
+//     rating, which spreads the work over the providers' first calls and keeps
+//     any one provider away from its failure and budget limits. Forty milli is
+//     small against the ratings, so the spread never reaches a model far below
+//     the best for the request;
+//   - the spread is not free: serving below the best rating loses quality, and
+//     quality 99 allows only 382 milli of weighted loss over the trial. The
+//     running weighted loss is tracked, and once it passes 200 milli the spread
+//     switches off and the ranking is the plain rating order again, so the
+//     remaining requests are served by the strongest model available. That
+//     keeps the loss far inside the quality-99 budget on every trial, while the
+//     spread does its work while the loss is still cheap;
 //   - a 402, a 429 or a 5xx is never the answer: the request is retried on the
 //     next candidate, and the refusal is counted against its provider;
 //   - the refusal's own message says whether the provider is done for the
@@ -58,6 +74,22 @@ export interface ProviderHealth {
 /** The most refusals a provider may give without an explanation before it is treated as dead. */
 const MAX_UNEXPLAINED_REFUSALS = 4;
 
+/** Rating charged, in milli, to a provider that has already been called once: its next call may refuse. */
+const USED_PROVIDER_PENALTY_MILLI = 40;
+
+/** Weighted quality loss (milli) at which the spread switches off: half the quality-99 budget, with room to spare. */
+const LOSS_GUARD_MILLI = 200;
+
+/** What the ranking needs to know about the trial so far, beyond per-provider health. */
+export interface RankingState {
+  /** Weighted quality loss accumulated so far: sum of weight * (best rating - served rating). */
+  lossSoFar: number;
+}
+
+export function newRankingState(): RankingState {
+  return { lossSoFar: 0 };
+}
+
 export function newHealth(): ProviderHealth {
   return { calls: 0, refusals: 0, dead: false };
 }
@@ -84,7 +116,8 @@ export function recordSuccess(health: ProviderHealth): void {
 /**
  * The candidates for one request, best first. `jsonOnWire` is true when the
  * request's JSON mode must ride the provider's wire (an OpenAI client with a
- * response_format); an Anthropic client never needs that.
+ * response_format); an Anthropic client never needs that. `ranking` carries the
+ * running weighted quality loss, which switches the spread off once it grows.
  */
 export function candidatesFor(
   brief: Brief,
@@ -92,6 +125,7 @@ export function candidatesFor(
   health: ReadonlyMap<string, ProviderHealth>,
   requires: Requirement,
   jsonOnWire: boolean,
+  ranking: RankingState,
 ): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
@@ -107,8 +141,16 @@ export function candidatesFor(
     }
   }
   const callsOf = (candidate: Candidate): number => health.get(candidate.provider.id)?.calls ?? 0;
+  // While the loss is cheap, a provider already in use is charged 40 milli: an
+  // untouched provider's first call is a certain answer, so its model wins
+  // over a used provider's model within 40 milli of it. Once the loss passes
+  // the guard, the charge is dropped and the plain rating order returns.
+  const spread = ranking.lossSoFar <= LOSS_GUARD_MILLI;
+  const effective = (candidate: Candidate): number =>
+    spread && callsOf(candidate) > 0 ? candidate.rating - USED_PROVIDER_PENALTY_MILLI : candidate.rating;
   out.sort((a, b) => {
-    if (b.rating !== a.rating) return b.rating - a.rating;
+    const rating = effective(b) - effective(a);
+    if (rating !== 0) return rating;
     const calls = callsOf(a) - callsOf(b);
     if (calls !== 0) return calls;
     if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
