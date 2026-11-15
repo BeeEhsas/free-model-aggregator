@@ -93,6 +93,26 @@ function partOf(block: Json): Json | null {
   return null;
 }
 
+/**
+ * One OpenAI content part as an Anthropic content block: text passes through,
+ * and an image_url becomes an image block with a base64 or URL source, so the
+ * provider receives the image it is asked about. (partOf above is the reverse
+ * direction, Anthropic blocks to OpenAI parts; it returns null for an
+ * image_url, which used to drop the image on this wire entirely.)
+ */
+function openAIBlockToAnthropic(block: Json): Json | null {
+  if (block.type === 'text' && typeof block.text === 'string') return { type: 'text', text: block.text };
+  if (block.type === 'image_url' && isRecord(block.image_url) && typeof block.image_url.url === 'string') {
+    const url = block.image_url.url;
+    const data = /^data:([^;,]+)?;base64,(.*)$/s.exec(url);
+    if (data !== null) {
+      return { type: 'image', source: { type: 'base64', media_type: data[1] !== '' ? data[1] : 'image/png', data: data[2] } };
+    }
+    return { type: 'image', source: { type: 'url', url } };
+  }
+  return null;
+}
+
 /** A tool_result block's content as text: its text blocks, or its JSON when it holds something else. */
 function toolResultText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -267,7 +287,7 @@ export function openAIToAnthropic(body: Json, model: string): Json {
         addToolResult(typeof block.tool_use_id === 'string' ? block.tool_use_id : '', block.content);
         continue;
       }
-      const part = partOf(block);
+      const part = openAIBlockToAnthropic(block);
       if (part !== null) blocks.push(part);
     }
     if (blocks.length > 0) pushUser(blocks);
