@@ -28,10 +28,15 @@
 //
 // ROUTING (lib/route.ts): every request is served by the strongest free model
 // meeting its requirements, ranked by the quality table's rating, then by how
-// little its provider has been called so far. A 402, a 429 or a 5xx is never the
-// answer: the request is retried on the next candidate, and the refusal's own
-// message says whether the provider is done for the trial (a spent budget, an
-// outage) or only refused that one call (its failure schedule).
+// little its provider has been called so far. A provider already in use is
+// charged 40 milli off its rating, which spreads the work over the providers'
+// first calls (a first call always answers) and keeps any one provider away
+// from its failure and budget limits; once the running weighted quality loss
+// passes 200 milli the spread switches off and the plain rating order returns,
+// so quality 99 stays safe. A 402, a 429 or a 5xx is never the answer: the
+// request is retried on the next candidate, and the refusal's own message says
+// whether the provider is done for the trial (a spent budget, an outage) or
+// only refused that one call (its failure schedule).
 //
 // WIRES (lib/wire.ts): each request is translated into the provider's wire and
 // the answer back into the client's, in JSON and in SSE, carrying the system
@@ -92,10 +97,12 @@ import {
 import {
   candidatesFor,
   newHealth,
+  newRankingState,
   recordRefusal,
   recordSuccess,
   type Candidate,
   type ProviderHealth,
+  type RankingState,
 } from './lib/route.ts';
 
 /** The wire protocol's version, in the register body. */
@@ -117,6 +124,8 @@ let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 /** What the providers' answers so far say about each of them, by provider id. */
 const healthByProvider = new Map<string, ProviderHealth>();
+/** The running weighted quality loss, which switches the ranking's spread off once it grows. */
+const rankingState: RankingState = newRankingState();
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
 
@@ -157,13 +166,13 @@ function servedModels(): ServedModel[] {
   return out;
 }
 
-/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): Requirement {
+/** The requirements and weight of the request now arriving: the manifest's row by arrival order, else the body's own. */
+function requirementsFor(body: Json): { requires: Requirement; weight: 1 | 2 } {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
-  return requirementsFromBody(body);
+  if (entry !== undefined) return { requires: entry.requires, weight: entry.weight };
+  return { requires: requirementsFromBody(body), weight: 1 };
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -376,21 +385,27 @@ async function tryCandidate(candidate: Candidate, clientApi: 'openai' | 'anthrop
  * provider is done for the trial marks it dead; a scheduled refusal does not.
  */
 async function answerRequest(clientApi: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
-  const requires = requirementsFor(body);
+  const { requires, weight } = requirementsFor(body);
   const jsonOnWire = clientApi === 'openai' && wantsJson(body);
-  const candidates = candidatesFor(brief, probes, healthByProvider, requires, jsonOnWire);
+  const candidates = candidatesFor(brief, probes, healthByProvider, requires, jsonOnWire, rankingState);
   if (candidates.length === 0) {
     return sendError(res, clientApi, 503, clientApi === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model on the directory meets this request');
   }
+  // The best rating any free model could serve this request with: the loss of
+  // serving it below that is weight * (best - served rating).
+  const best = candidates.reduce((top, candidate) => Math.max(top, candidate.rating), 0);
   const stream = body.stream === true;
   for (const candidate of candidates) {
     const outcome = await tryCandidate(candidate, clientApi, body);
     if (outcome.kind === 'next') continue;
     if (outcome.kind === 'fatal') {
       // A 400 or a 401 says the request itself was wrong: another provider would answer the same way.
+      // The request goes unserved, so its whole weight counts as loss.
+      rankingState.lossSoFar += weight * best;
       return sendError(res, clientApi, outcome.status, clientApi === 'anthropic' ? 'api_error' : 'invalid_request_error', `the provider answered HTTP ${outcome.status}: ${outcome.message.slice(0, 200)}`);
     }
     const result = outcome.result;
+    rankingState.lossSoFar += weight * (best - candidate.rating);
     if (stream) {
       // tryCandidate only returns ok for a stream with a body.
       const upstream = result.stream as ReadableStream<Uint8Array>;
@@ -417,6 +432,8 @@ async function answerRequest(clientApi: 'openai' | 'anthropic', body: Json, res:
     sendJson(res, 200, translateJson(clientApi, candidate.provider.wire, json, candidate.model.id));
     return;
   }
+  // Every candidate refused: the request goes unserved, so its whole weight counts as loss.
+  rankingState.lossSoFar += weight * best;
   return sendError(res, clientApi, 503, clientApi === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'every free model that meets this request refused it');
 }
 
