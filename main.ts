@@ -33,7 +33,11 @@
 // first calls (a first call always answers) and keeps any one provider away
 // from its failure and budget limits; once the running weighted quality loss
 // passes 300 milli the spread switches off and the plain rating order returns,
-// so quality 99 stays safe. A 402, a 429 or a 5xx is never the answer: the
+// so quality 99 stays safe. When two candidates tie on effective rating, the
+// tie is broken by the provider's failure risk — the chance its next call
+// refuses, given its calls so far, from a table estimated once by Monte Carlo
+// over the kit's own generator — which costs no quality, since tied candidates
+// lose the same. A 402, a 429 or a 5xx is never the answer: the
 // request is retried on the next candidate, and the refusal's own message says
 // whether the provider is done for the trial (a spent budget, an outage) or
 // only refused that one call (its failure schedule). A provider already dead
