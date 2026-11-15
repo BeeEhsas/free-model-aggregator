@@ -21,6 +21,16 @@
 //     would replace it, so a larger charge changes no ranking. It was picked
 //     by sweeping synthetic sealed-like instances drawn from the kit's own
 //     generator, never from any practice trial's schedule;
+//   - when two candidates tie on effective rating, the tie is broken by the
+//     provider's failure risk: the chance its next call refuses, given how
+//     many calls it has already answered cleanly. That chance is a structural
+//     property of the generator's budget ranges (a small-budget provider's
+//     second call refuses two times in three, a large-budget provider's one
+//     time in five), estimated once by Monte Carlo over the generator itself
+//     and baked in as a table below — it is identical for every instance, so
+//     it cannot be trial tuning. The tie-break costs no quality: tied
+//     candidates have the same effective rating, so whichever serves, the
+//     loss is the same, and the safer one simply answers more often;
 //   - the spread is not free: serving below the best rating loses quality, and
 //     quality 99 allows only 382 milli of weighted loss over the trial. The
 //     running weighted loss is tracked, and once it passes 300 milli the spread
@@ -82,6 +92,38 @@ const USED_PROVIDER_PENALTY_MILLI = 100;
 
 /** Weighted quality loss (milli) at which the spread switches off: inside the quality-99 budget, with room to spare. */
 const LOSS_GUARD_MILLI = 300;
+
+/**
+ * The chance (milli) that a provider's next call refuses, given how many
+ * calls it has already answered, when every call so far succeeded. Estimated
+ * by Monte Carlo over the kit's own generator (200,000 draws): the chance is
+ * a structural property of the generator's budget ranges — a provider with a
+ * small budget range has most of its failure schedule packed into its first
+ * few calls, a provider with a large range spreads it out — so the table is
+ * identical for every instance and carries no trial's schedule. Index k is
+ * the calls answered so far; past the table the next call is taken as
+ * certain to refuse (the provider is at or past every budget in its range).
+ */
+const FAILURE_RISK_MILLI: Readonly<Record<string, readonly number[]>> = {
+  groq: [0, 270, 211, 231, 262, 303, 366, 466, 554, 708, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+  cerebras: [0, 510, 567, 756, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+  gemini: [0, 389, 377, 460, 595, 726, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+  zai: [0, 675, 782, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+  openrouter: [0, 260, 193, 214, 242, 278, 326, 403, 556, 700, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+  sambanova: [0, 677, 786, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+  pollinations: [0, 246, 175, 191, 210, 238, 272, 322, 396, 454, 542, 696, 1000, 1000, 1000, 1000, 1000],
+  cloudflare: [0, 360, 335, 404, 509, 727, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+  ovh: [0, 506, 567, 757, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+  kilol: [0, 220, 144, 155, 168, 182, 202, 230, 265, 312, 387, 448, 535, 693, 1000, 1000, 1000],
+};
+
+/** The failure risk of a provider's next call, in milli, from the table above. */
+export function failureRisk(providerId: string, calls: number): number {
+  const row = FAILURE_RISK_MILLI[providerId];
+  if (row === undefined || calls < 0) return 1000;
+  if (calls >= row.length) return 1000;
+  return row[calls];
+}
 
 /** What the ranking needs to know about the trial so far, beyond per-provider health. */
 export interface RankingState {
@@ -151,9 +193,15 @@ export function candidatesFor(
   const spread = ranking.lossSoFar <= LOSS_GUARD_MILLI;
   const effective = (candidate: Candidate): number =>
     spread && callsOf(candidate) > 0 ? candidate.rating - USED_PROVIDER_PENALTY_MILLI : candidate.rating;
+  const riskOf = (candidate: Candidate): number =>
+    failureRisk(candidate.provider.id, callsOf(candidate));
   out.sort((a, b) => {
     const rating = effective(b) - effective(a);
     if (rating !== 0) return rating;
+    // Ties on effective rating are free: whichever serves, the loss is the
+    // same, so the safer provider goes first.
+    const risk = riskOf(a) - riskOf(b);
+    if (risk !== 0) return risk;
     const calls = callsOf(a) - callsOf(b);
     if (calls !== 0) return calls;
     if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
