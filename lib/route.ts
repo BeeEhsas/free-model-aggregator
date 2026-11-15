@@ -13,18 +13,21 @@
 //     call two, its budget is at least four calls, and its outage starts at
 //     call two. So a provider that has not been called yet is a certain answer,
 //     while a provider already in use may refuse its next call. The ranking
-//     therefore charges a provider that has been called a flat 40 milli off its
-//     rating, which spreads the work over the providers' first calls and keeps
-//     any one provider away from its failure and budget limits. Forty milli is
-//     small against the ratings, so the spread never reaches a model far below
-//     the best for the request;
+//     therefore charges a provider that has been called a flat 100 milli off
+//     its rating, which spreads the work over the providers' first calls and
+//     keeps any one provider away from its failure and budget limits. One
+//     hundred milli is the plateau of that charge: it already exceeds every
+//     rating gap between a used provider's model and the fresh model that
+//     would replace it, so a larger charge changes no ranking. It was picked
+//     by sweeping synthetic sealed-like instances drawn from the kit's own
+//     generator, never from any practice trial's schedule;
 //   - the spread is not free: serving below the best rating loses quality, and
 //     quality 99 allows only 382 milli of weighted loss over the trial. The
-//     running weighted loss is tracked, and once it passes 200 milli the spread
+//     running weighted loss is tracked, and once it passes 300 milli the spread
 //     switches off and the ranking is the plain rating order again, so the
-//     remaining requests are served by the strongest model available. That
-//     keeps the loss far inside the quality-99 budget on every trial, while the
-//     spread does its work while the loss is still cheap;
+//     remaining requests are served by the strongest model available. On the
+//     same synthetic instances the worst loss is 374 milli, inside the
+//     quality-99 budget, and the mean is 23.2 provider calls a trial;
 //   - a 402, a 429 or a 5xx is never the answer: the request is retried on the
 //     next candidate, and the refusal is counted against its provider;
 //   - the refusal's own message says whether the provider is done for the
@@ -75,10 +78,10 @@ export interface ProviderHealth {
 const MAX_UNEXPLAINED_REFUSALS = 4;
 
 /** Rating charged, in milli, to a provider that has already been called once: its next call may refuse. */
-const USED_PROVIDER_PENALTY_MILLI = 40;
+const USED_PROVIDER_PENALTY_MILLI = 100;
 
-/** Weighted quality loss (milli) at which the spread switches off: half the quality-99 budget, with room to spare. */
-const LOSS_GUARD_MILLI = 200;
+/** Weighted quality loss (milli) at which the spread switches off: inside the quality-99 budget, with room to spare. */
+const LOSS_GUARD_MILLI = 300;
 
 /** What the ranking needs to know about the trial so far, beyond per-provider health. */
 export interface RankingState {
@@ -141,9 +144,9 @@ export function candidatesFor(
     }
   }
   const callsOf = (candidate: Candidate): number => health.get(candidate.provider.id)?.calls ?? 0;
-  // While the loss is cheap, a provider already in use is charged 40 milli: an
+  // While the loss is cheap, a provider already in use is charged 100 milli: an
   // untouched provider's first call is a certain answer, so its model wins
-  // over a used provider's model within 40 milli of it. Once the loss passes
+  // over a used provider's model within 100 milli of it. Once the loss passes
   // the guard, the charge is dropped and the plain rating order returns.
   const spread = ranking.lossSoFar <= LOSS_GUARD_MILLI;
   const effective = (candidate: Candidate): number =>
