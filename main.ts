@@ -29,14 +29,15 @@
 // ROUTING (lib/route.ts): every request is served by the strongest free model
 // meeting its requirements, ranked by the quality table's rating, then by how
 // little its provider has been called so far. A provider already in use is
-// charged 40 milli off its rating, which spreads the work over the providers'
+// charged 100 milli off its rating, which spreads the work over the providers'
 // first calls (a first call always answers) and keeps any one provider away
 // from its failure and budget limits; once the running weighted quality loss
-// passes 200 milli the spread switches off and the plain rating order returns,
+// passes 300 milli the spread switches off and the plain rating order returns,
 // so quality 99 stays safe. A 402, a 429 or a 5xx is never the answer: the
 // request is retried on the next candidate, and the refusal's own message says
 // whether the provider is done for the trial (a spent budget, an outage) or
-// only refused that one call (its failure schedule).
+// only refused that one call (its failure schedule). A provider already dead
+// when its turn comes is skipped without a call.
 //
 // WIRES (lib/wire.ts): each request is translated into the provider's wire and
 // the answer back into the client's, in JSON and in SSE, carrying the system
@@ -346,6 +347,10 @@ type AttemptOutcome =
  */
 async function tryCandidate(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): Promise<AttemptOutcome> {
   const health = healthOf(candidate.provider.id);
+  // A provider that died during this request (its budget spent, its outage
+  // begun) refuses every later call: its other models would only waste a
+  // call, so do not dial it.
+  if (health.dead) return { kind: 'next' };
   const stream = body.stream === true;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let result: UpstreamResult;
